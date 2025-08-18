@@ -1,0 +1,198 @@
+data:
+  tokenizer: null
+  train_files: data/blackjack-text-free_think/train.parquet
+  val_files: data/blackjack-text-free_think/test.parquet
+  prompt_key: prompt
+  max_prompt_length: 1024
+  max_response_length: 150
+  max_trajectory_length: 1200
+  train_batch_size: 16
+  val_batch_size: null
+  return_raw_input_ids: false
+  return_raw_chat: false
+  shuffle: true
+  filter_overlong_prompts: false
+  truncation: left
+  image_key: images
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: Qwen/Qwen2.5-0.5B-Instruct
+    external_lib: null
+    override_config: {}
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size: null
+    ppo_micro_batch_size_per_gpu: 1
+    use_dynamic_bsz: false
+    ppo_max_token_len_per_gpu: 16384
+    grad_clip: 1.0
+    grad_norm_threshold: 1000
+    clip_ratio: 0.2
+    entropy_coeff: 0.001
+    use_kl_loss: false
+    kl_loss_coef: 0.001
+    kl_loss_type: mse
+    ppo_epochs: 1
+    shuffle: false
+    ulysses_sequence_parallel_size: 1
+    optim:
+      lr: 1.0e-06
+      lr_warmup_steps_ratio: 0.0
+      min_lr_ratio: null
+      warmup_style: constant
+      total_training_steps: -1
+    fsdp_config:
+      wrap_policy:
+        min_num_params: 0
+      param_offload: true
+      optimizer_offload: true
+      fsdp_size: -1
+  ref:
+    fsdp_config:
+      param_offload: true
+      wrap_policy:
+        min_num_params: 0
+    log_prob_micro_batch_size: null
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size}
+  rollout:
+    name: vllm
+    temperature: 0.7
+    top_k: -1
+    top_p: 0.95
+    use_fire_sampling: false
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    max_trajectory_length: ${data.max_trajectory_length}
+    dtype: bfloat16
+    gpu_memory_utilization: 0.1
+    ignore_eos: false
+    enforce_eager: false
+    free_cache_engine: false
+    load_format: dummy_dtensor
+    tensor_model_parallel_size: 2
+    max_num_batched_tokens: 8192
+    max_model_len: null
+    max_num_seqs: 1024
+    log_prob_micro_batch_size: null
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    disable_log_stats: true
+    enable_chunked_prefill: false
+    do_sample: true
+    'n': 1
+    limit_mm_per_prompt: 5
+critic:
+  strategy: fsdp
+  optim:
+    lr: 1.0e-05
+    lr_warmup_steps_ratio: 0.0
+    min_lr_ratio: null
+    warmup_style: constant
+    total_training_steps: -1
+  model:
+    path: Qwen/Qwen2.5-VL-3B-Instruct
+    tokenizer_path: ${actor_rollout_ref.model.path}
+    override_config: {}
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+      wrap_policy:
+        min_num_params: 0
+      fsdp_size: -1
+  ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
+  ppo_micro_batch_size: null
+  ppo_micro_batch_size_per_gpu: 1
+  forward_micro_batch_size: ${critic.ppo_micro_batch_size}
+  forward_micro_batch_size_per_gpu: ${critic.ppo_micro_batch_size_per_gpu}
+  use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+  ppo_max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: ${critic.ppo_max_token_len_per_gpu}
+  ulysses_sequence_parallel_size: 1
+  ppo_epochs: ${actor_rollout_ref.actor.ppo_epochs}
+  shuffle: ${actor_rollout_ref.actor.shuffle}
+  grad_clip: 1.0
+  cliprange_value: 0.5
+  use_reward_mask: false
+reward_model:
+  enable: false
+  strategy: fsdp
+  model:
+    input_tokenizer: ${actor_rollout_ref.model.path}
+    path: ~/models/FsfairX-LLaMA3-RM-v0.1
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    use_remove_padding: false
+    fsdp_config:
+      wrap_policy:
+        min_num_params: 0
+      param_offload: false
+      fsdp_size: -1
+  micro_batch_size: null
+  micro_batch_size_per_gpu: null
+  max_length: null
+  ulysses_sequence_parallel_size: 1
+  use_dynamic_bsz: ${critic.use_dynamic_bsz}
+  forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
+  reward_manager: naive
+custom_reward_function:
+  path: null
+  name: compute_score
+algorithm:
+  gamma: 1.0
+  high_level_gamma: 1.0
+  lam: 1.0
+  adv_estimator: grpo
+  kl_penalty: kl
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+trainer:
+  balance_batch: true
+  total_epochs: 30
+  total_training_steps: 200
+  project_name: vagen_blackjack
+  experiment_name: blackjack-text-free_think
+  logger:
+  - console
+  - wandb
+  val_generations_to_log_to_wandb: 8
+  nnodes: 1
+  n_gpus_per_node: 4
+  save_freq: 100
+  resume_mode: auto
+  resume_from_path: false
+  test_freq: 20
+  critic_warmup: 0
+  default_hdfs_dir: null
+  remove_previous_ckpt_in_save: false
+  del_local_ckpt_after_load: false
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  val_before_train: true
+  val_only: false
+rollout_manager:
+  max_trajectory_length: ${data.max_trajectory_length}
+  window_size: 3
+  max_turns: 5
+  n_gpus_per_node: ${trainer.n_gpus_per_node}
+  n_trajectory: 8
+  use_multi_turn_reward: false
+  use_loss_mask: true
+  use_gae_mask: true
+  special_token_for_loss_mask:
+  - <|box_start|>
+  - <|box_end|>
+  truncation: ${data.truncation}
+  base_url: http://localhost:5000
+  use_service: true
+  timeout: 300
+  max_workers: 8
