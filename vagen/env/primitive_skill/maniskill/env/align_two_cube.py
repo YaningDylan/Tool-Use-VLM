@@ -137,13 +137,13 @@ class AlignTwoCubeEnv(BaseEnv):
 
 
     def _get_obs_extra(self, info: Dict):
-        assert "state" in self.obs_mode
-        obs = dict(
-            red_cube_position=info["red_cube_position"],
-            green_cube_position=info["green_cube_position"],
-            is_red_cube_at_x0=info["is_red_cube_at_x0"],
-            is_green_cube_at_x0=info["is_green_cube_at_x0"],
-        )
+        if "state" in self.obs_mode or "segmentation" in self.obs_mode:
+            obs = dict(
+                red_cube_position=info["red_cube_position"],
+                green_cube_position=info["green_cube_position"],
+                is_red_cube_at_x0=info["is_red_cube_at_x0"],
+                is_green_cube_at_x0=info["is_green_cube_at_x0"],
+            )
         return obs
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):

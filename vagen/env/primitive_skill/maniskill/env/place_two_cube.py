@@ -132,15 +132,15 @@ class PlaceTwoCubeEnv(BaseEnv):
         return distance <= self.goal_radius
 
     def _get_obs_extra(self, info: Dict):
-        assert "state" in self.obs_mode
-        obs = dict(
-            red_cube_position=info["red_cube_position"],
-            green_cube_position=info["green_cube_position"],
-            is_red_cube_grasped=info["is_red_cube_grasped"],
-            is_green_cube_grasped=info["is_green_cube_grasped"],
-            left_target_position=self.goal_region_A.pose.p,
-            right_target_position=self.goal_region_B.pose.p,
-        )
+        if "state" in self.obs_mode or "segmentation" in self.obs_mode:
+            obs = dict(
+                red_cube_position=info["red_cube_position"],
+                green_cube_position=info["green_cube_position"],
+                is_red_cube_grasped=info["is_red_cube_grasped"],
+                is_green_cube_grasped=info["is_green_cube_grasped"],
+                left_target_position=self.goal_region_A.pose.p,
+                right_target_position=self.goal_region_B.pose.p,
+            )
         return obs
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
@@ -211,4 +211,87 @@ class PlaceTwoCubeEnv(BaseEnv):
         # reset reward components to 0
         return super().reset(**kwargs)
     
-    
+    def get_segmentation_data(self):
+        """
+        Get filtered segmentation data for PlaceTwoCube task
+        
+        Returns:
+            tuple: (segmentation_array, segmentation_id_map, object_positions)
+        """
+        # Get raw observation with segmentation
+        obs = self.get_obs()
+        
+        if 'sensor_data' not in obs:
+            return None, None, None
+        
+        sensor_data = obs['sensor_data']
+        if 'base_camera' not in sensor_data:
+            return None, None, None
+        
+        camera_data = sensor_data['base_camera']
+        if 'segmentation' not in camera_data:
+            return None, None, None
+        
+        # Extract segmentation data
+        seg_data = camera_data['segmentation']
+        if hasattr(seg_data, 'cpu'):
+            seg_data = seg_data.cpu().numpy()
+        
+        # Handle dimensions
+        if len(seg_data.shape) == 4:
+            seg_data = seg_data[0]
+        if len(seg_data.shape) == 3 and seg_data.shape[-1] == 1:
+            seg_data = seg_data.squeeze(-1)
+        
+        segmentation = seg_data.astype(np.int16)
+        
+        # Get full segmentation ID map
+        full_seg_map = {}
+        if hasattr(self, 'segmentation_id_map'):
+            full_seg_map = self.segmentation_id_map
+        elif hasattr(self, 'unwrapped') and hasattr(self.unwrapped, 'segmentation_id_map'):
+            full_seg_map = self.unwrapped.segmentation_id_map
+        
+        # Filter for PlaceTwoCube task - only keep cubes and goal regions
+        task_objects = ['red_cube', 'green_cube', 'left_target', 'right_target']
+        
+        filtered_seg_map = {}
+        new_id_mapping = {}
+        new_id = 1
+        
+        for obj_id, obj_info in full_seg_map.items():
+            if obj_id == 0:
+                continue
+            
+            obj_str = str(obj_info)
+            if '<' in obj_str and ':' in obj_str:
+                obj_name = obj_str.split('<')[1].split(':')[0].strip()
+                
+                if obj_name == 'goal_region_A':
+                    obj_name = 'left_target'
+                elif obj_name == 'goal_region_B':
+                    obj_name = 'right_target'
+                
+                for target_name in task_objects:
+                    if target_name in obj_name:
+                        filtered_seg_map[new_id] = obj_info   
+                        new_id_mapping[obj_id] = new_id
+                        new_id += 1
+                        break
+        
+        # Create filtered segmentation array - only mark the 4 objects, everything else is 0
+        filtered_segmentation = np.zeros_like(segmentation, dtype=np.int16)
+        for old_id, new_id in new_id_mapping.items():
+            mask = (segmentation == old_id)
+            filtered_segmentation[mask] = new_id
+            
+        
+        # Get object positions (in mm for robot actions)
+        object_positions = {
+            'red_cube_position': (self.red_cube.pose.p.cpu().numpy() * 1000).tolist(),
+            'green_cube_position': (self.green_cube.pose.p.cpu().numpy() * 1000).tolist(),
+            'left_target_position': (self.goal_region_A.pose.p.cpu().numpy() * 1000).tolist(),
+            'right_target_position': (self.goal_region_B.pose.p.cpu().numpy() * 1000).tolist(),
+        }
+        
+        return filtered_segmentation, filtered_seg_map, object_positions

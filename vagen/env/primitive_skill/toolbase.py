@@ -309,12 +309,12 @@ class SegmentationTools:
                 )
             
             # Step 4: Match SAM result with environment objects
-            matched_objects = self.sam_matcher.match_sam_to_environment(
-                sam_results=[sam_result],
+            matched_objects = self.sam_tool.segment_and_match_objects(
+                image=current_image,
+                descriptions=[description],
                 env_segmentation=env_segmentation,
                 env_segmentation_map=env_seg_map,
-                env_positions=env_positions,
-                min_overlap_threshold=0.2
+                env_positions=env_positions
             )
             
             if not matched_objects:
@@ -379,14 +379,13 @@ class SegmentationTools:
                     'name': obj.object_name,
                     'type': obj.object_type,
                     'color': obj.color,
-                    'position_2d': obj.position_2d,  # 像素坐标
-                    'position_3d': obj.position_3d,  # 世界坐标（毫米）
+                    'position_2d': obj.position_2d,  
+                    'position_3d': obj.position_3d,  
                     'bounding_box_2d': obj.bounding_box_2d,
                     'pixel_count': obj.pixel_count
                 }
                 object_summary.append(summary)
                 
-                # 为VLM创建描述
                 color_str = f"{obj.color} " if obj.color else ""
                 message_parts.append(f"{color_str}{obj.object_type} at 2D:{obj.position_2d} 3D:{obj.position_3d}")
             

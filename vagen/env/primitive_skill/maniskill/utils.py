@@ -8,10 +8,31 @@ from vagen.env.primitive_skill.maniskill.skill_wrapper import SkillGymWrapper
 import numpy as np
 import os
 
-
-
-def build_env(env_id, control_mode="pd_ee_delta_pose", stage=0, record_dir='./test'):
-    env_kwargs = dict(obs_mode="state", control_mode=control_mode, render_mode="rgb_array", sim_backend="cpu",render_backend="gpu")
+def build_env(env_id, control_mode="pd_ee_delta_pose", stage=0, record_dir='./test', obs_mode=None):
+    """
+    Build ManiSkill environment with specified observation mode
+    
+    Args:
+        env_id: Environment ID
+        control_mode: Control mode for the robot
+        stage: Environment stage
+        record_dir: Directory for recording videos
+        obs_mode: Observation mode - if None, defaults to "state", 
+                 but can be set to "rgb+depth+segmentation" for segmentation data
+    """
+    # Default to "state" if no obs_mode specified (backward compatibility)
+    if obs_mode is None:
+        obs_mode = "state"
+    
+    # Environment configuration
+    env_kwargs = dict(
+        obs_mode=obs_mode,  # Use the specified obs_mode
+        control_mode=control_mode, 
+        render_mode="rgb_array", 
+        sim_backend="cpu",
+        render_backend="gpu"
+    )
+    
     env = gym.make(env_id, num_envs=1, enable_shadow=True, stage=stage, **env_kwargs)
     env = CPUGymWrapper(env)
     env = SkillGymWrapper(env,
@@ -25,13 +46,13 @@ def build_env(env_id, control_mode="pd_ee_delta_pose", stage=0, record_dir='./te
     env.is_params_scaled = False
     return env
 
-
-def handle_info(info,state_keys,mask_success=False,env=None,):
+def handle_info(info, state_keys, mask_success=False, env=None):
+    """Handle environment info with enhanced debugging for segmentation"""
     obj_positions = {}
     other_info = {}
     
     # HARD-CODED POPLIST
-    pop_list_1=['is_success', 'num_timesteps', 'elapsed_steps', 'skill_success', 'reward_components']
+    pop_list_1 = ['is_success', 'num_timesteps', 'elapsed_steps', 'skill_success', 'reward_components']
     # Remove specific keys
     for k in pop_list_1:
         if k in info:
@@ -58,7 +79,6 @@ def handle_info(info,state_keys,mask_success=False,env=None,):
             else:
                 other_info[k] = v
     
-    
     if mask_success:
         final_info = {}
         for k in env.vlm_info_keys:
@@ -76,7 +96,20 @@ def handle_info(info,state_keys,mask_success=False,env=None,):
     }
     
 def get_workspace_limits(env):
+    """Get workspace limits from environment"""
     x_workspace = tuple(np.round(np.array(env.workspace_x)*1000, 0).astype(int))
     y_workspace = tuple(np.round(np.array(env.workspace_y)*1000, 0).astype(int))
     z_workspace = tuple(np.round(np.array(env.workspace_z)*1000, 0).astype(int))
     return x_workspace, y_workspace, z_workspace
+
+def build_env_with_segmentation(env_id, control_mode="pd_ee_delta_pose", stage=0, record_dir='./test'):
+    """
+    Convenience function to build environment with segmentation enabled
+    """
+    return build_env(
+        env_id=env_id,
+        control_mode=control_mode,
+        stage=stage,
+        record_dir=record_dir,
+        obs_mode="rgb+depth+segmentation"  # Enable segmentation
+    )

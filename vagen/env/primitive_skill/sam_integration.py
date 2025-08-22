@@ -482,13 +482,68 @@ class SAMTool:
             print("✗ No successful segmentations")
             return []
         
-        # Match with environment
-        matched_objects = self.matcher.match_sam_to_environment(
-            sam_results=sam_results,
-            env_segmentation=env_segmentation,
-            env_segmentation_map=env_segmentation_map,
-            env_positions=env_positions
-        )
+        # Use distance-based matching - find closest object to SAM center
+        matched_objects = []
+        
+        for sam_result in sam_results:
+            sam_center_x, sam_center_y = sam_result.center_2d
+            
+            print(f"\n🎯 Distance-based matching for '{sam_result.description}':")
+            print(f"   SAM center: ({sam_center_x}, {sam_center_y})")
+            
+            best_match = None
+            min_distance = float('inf')
+            
+            # Check each object ID in the filtered segmentation
+            for obj_id in np.unique(env_segmentation):
+                if obj_id == 0:  # Skip background
+                    continue
+                
+                if obj_id in env_segmentation_map:
+                    # Find all pixels belonging to this object
+                    object_mask = (env_segmentation == obj_id)
+                    object_pixels = np.where(object_mask)
+                    
+                    if len(object_pixels[0]) > 0:
+                        # Calculate object center
+                        obj_center_y = int(object_pixels[0].mean())
+                        obj_center_x = int(object_pixels[1].mean())
+                        
+                        # Calculate distance from SAM center to object center
+                        distance = np.sqrt((sam_center_x - obj_center_x)**2 + (sam_center_y - obj_center_y)**2)
+                        
+                        # Get object info
+                        obj_name = self.matcher._extract_object_name(env_segmentation_map[obj_id])
+                        obj_position = self.matcher._get_object_position(obj_name, env_positions)
+                        
+                        print(f"   Object {obj_id} ({obj_name}) center: ({obj_center_x}, {obj_center_y}), distance: {distance:.1f}")
+                        
+                        if obj_position is not None and distance < min_distance:
+                            min_distance = distance
+                            best_match = {
+                                'obj_id': obj_id,
+                                'obj_name': obj_name,
+                                'obj_position': obj_position,
+                                'obj_center': (obj_center_x, obj_center_y),
+                                'distance': distance
+                            }
+            
+            if best_match is not None:
+                matched_obj = MatchedObject(
+                    sam_result=sam_result,
+                    env_object_id=best_match['obj_id'],
+                    env_object_name=best_match['obj_name'],
+                    env_position_3d=best_match['obj_position'],
+                    match_confidence=sam_result.detection_confidence,
+                    overlap_score=1.0  # Perfect match since we use distance
+                )
+                matched_objects.append(matched_obj)
+                
+                print(f"   ✅ Best match: {best_match['obj_name']} at distance {min_distance:.1f} pixels")
+            else:
+                print(f"   ❌ No valid objects found for matching")
+        
+        return matched_objects
         
         return matched_objects
     
