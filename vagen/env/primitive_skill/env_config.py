@@ -16,15 +16,14 @@ class PrimitiveSkillEnvConfig(BaseEnvConfig):
     # "free_think", "no_think", "grounding", "worldmodeling", "grounding_worldmodeling",
     # "grounding_structured","worldmodeling_structured","grounding_worldmodeling_structured"
     
-    # Enhanced toolbase configuration
-    enable_enhanced_tools: bool = True
-    toolbase_config: Dict[str, Any] = field(default_factory=lambda: {
-        'enable_yolo': True,
-        'yolo': {
-            'model_path': 'yolov8n.pt',
-            'device': 'cpu',
-            'confidence_threshold': 0.5
-        }
+    # Segmentation and SAM support
+    enable_segmentation: bool = field(default=False)  # Enable segmentation data collection
+    enable_sam: bool = field(default=False)  # Enable SAM enhancement
+    sam_config: Dict[str, Any] = field(default_factory=lambda: {
+        'sam_checkpoint_path': 'sam_vit_h_4b8939.pth',
+        'model_type': 'vit_h',
+        'device': 'cpu',
+        'confidence_threshold': 0.1
     })
     
     # configs for process reward for grounding and world modeling
@@ -33,6 +32,6 @@ class PrimitiveSkillEnvConfig(BaseEnvConfig):
     worldmodeling_reward_weight: float = 0.5
     
     def config_id(self) -> str:
-        id_fields = ["env_id", "render_mode", "max_actions_per_step", "enable_enhanced_tools"]
+        id_fields = ["env_id", "render_mode", "max_actions_per_step", "enable_segmentation", "enable_sam"]
         id_str = ",".join([f"{field.name}={getattr(self, field.name)}" for field in fields(self) if field.name in id_fields])
         return f"PrimitiveSkillEnvConfig({id_str})"

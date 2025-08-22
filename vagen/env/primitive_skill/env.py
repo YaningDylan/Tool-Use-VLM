@@ -1,6 +1,7 @@
 from vagen.env.base.base_env import BaseEnv
 import numpy as np
 import copy
+import torch
 from typing import Dict, List, Optional, Tuple, Any
 from gymnasium.utils import seeding
 from vagen.env.utils.context_utils import convert_numpy_to_PIL
@@ -8,15 +9,13 @@ from vagen.env.utils.parse_utils import PARSE_FUNC_MAP
 from .env_config import PrimitiveSkillEnvConfig
 from .maniskill.utils import build_env, handle_info, get_workspace_limits
 from .prompt import system_prompt, init_observation_template, action_template, format_prompt
-from .toolbase import ManiSkillTools, ToolExecutor, ToolCallParser, get_available_tools_description
 import vagen.env.primitive_skill.maniskill.env
 import random
 from vagen.env.utils.state_reward_text_utils import env_state_reward_wrapper
-
 class PrimitiveSkillEnv(BaseEnv):
     def __init__(self, config: PrimitiveSkillEnvConfig):
         """
-        Initialize the PrimitiveSkill environment with optional enhanced tools.
+        Initialize the PrimitiveSkill environment with optional segmentation and SAM support.
         
         Args:
             config (PrimitiveSkillEnvConfig): Configuration parameters for the environment
@@ -27,7 +26,39 @@ class PrimitiveSkillEnv(BaseEnv):
             record_dir = self.config.video_record_dir
         else:
             record_dir = None
-        self.env = build_env(config.env_id, record_dir=record_dir)
+        
+        # Determine if we need segmentation data
+        enable_segmentation = getattr(config, 'enable_segmentation', False)
+        enable_sam = getattr(config, 'enable_sam', False)
+        
+        # SAM requires segmentation
+        if enable_sam:
+            enable_segmentation = True
+        
+        if enable_segmentation:
+            # Use the updated build_env with segmentation support
+            from .maniskill.utils import build_env_with_segmentation
+            self.env = build_env_with_segmentation(config.env_id, record_dir=record_dir)
+            print("Environment created with segmentation support")
+        else:
+            # Use the original build_env for backward compatibility
+            self.env = build_env(config.env_id, record_dir=record_dir)
+        
+        # Initialize tools with SAM support
+        from .toolbase import SegmentationTools, SegmentationToolExecutor, get_segmentation_tools_description
+        
+        self.tools = SegmentationTools(
+            self, 
+            enable_sam=enable_sam,
+            sam_config=config.sam_config if enable_sam else None
+        )
+        self.tool_executor = SegmentationToolExecutor(self.tools)
+        self.tools_description = get_segmentation_tools_description(enable_sam=enable_sam)
+        
+        if enable_sam:
+            print("SAM-enhanced tools initialized")
+        else:
+            print("Basic segmentation tools initialized")
         
         # Store the format prompt function for later use based on the configuration
         self.format_prompt_func = format_prompt[self.config.prompt_format]
@@ -35,22 +66,6 @@ class PrimitiveSkillEnv(BaseEnv):
         # Define the state keys for the environment
         self.state_keys = self.env.state_keys
         self.last_info = None
-        
-        # Initialize tools based on configuration
-        if self.config.enable_enhanced_tools:
-            # Use enhanced tools with YOLO integration
-            from .enhanced_toolbase import EnhancedManiSkillTools, EnhancedToolExecutor, get_enhanced_tools_description
-            self.tools = EnhancedManiSkillTools(self, self.config.toolbase_config)
-            self.tool_executor = EnhancedToolExecutor(self.tools)
-            self.tools_description = get_enhanced_tools_description()
-            print(" Enhanced tools with YOLO enabled")
-        else:
-            # Use original tools only
-            from .toolbase import ManiSkillTools, ToolExecutor, get_available_tools_description
-            self.tools = ManiSkillTools(self)
-            self.tool_executor = ToolExecutor(self.tools)
-            self.tools_description = get_available_tools_description()
-            print(" Basic tools enabled")
     
     def reset(self, seed: Optional[int] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
@@ -73,83 +88,13 @@ class PrimitiveSkillEnv(BaseEnv):
         self.steps = 0
         return obs, {}
     
-    def _is_tool_call(self, action_str: str) -> bool:
-        """
-        Check if the action string contains tool calls
-        
-        Args:
-            action_str: Input string from VLM
-            
-        Returns:
-            True if contains tool calls, False if contains robot actions
-        """
-        # Check for common tool patterns
-        tool_patterns = [
-            r'get_pos\s*\(',
-            r'get_targets\s*\(',
-            r'get_objects\s*\(',
-            r'get_workspace\s*\(',
-            r'get_object_position_by_color\s*\(',
-            r'get_target_positions\s*\(',
-            r'get_all_objects\s*\(',
-            r'get_workspace_limits\s*\(',
-            r'detect_scene\s*\(',
-            r'find_object\s*\(',
-            r'get_spatial_relations\s*\(',
-        ]
-        
-        import re
-        for pattern in tool_patterns:
-            if re.search(pattern, action_str, re.IGNORECASE):
-                return True
-        
-        return False
-    
-    def _handle_tool_call(self, action_str: str) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
-        """
-        Handle tool calls from VLM
-        
-        Args:
-            action_str: String containing tool calls
-            
-        Returns:
-            Tuple of (observation, reward, done, info)
-        """
-        # Execute tool calls
-        tool_results, formatted_results = self.tool_executor.execute_tool_calls(action_str)
-        
-        # Create observation with tool results
-        obs = self._render_with_tools(action_str, formatted_results)
-        
-        # Tool calls don't change environment state, so no reward and not done
-        reward = 0
-        done = False
-        
-        # Add tool execution info
-        info = {
-            "tool_calls_executed": len(tool_results),
-            "tool_results": tool_results,
-            "tool_response": formatted_results,
-            "is_tool_step": True,
-            "metrics": {
-                "turn_metrics": {
-                    "action_is_valid": all(r.success for r in tool_results),
-                },
-                "traj_metrics": {
-                    "success": False,
-                },
-            }
-        }
-        
-        return obs, reward, done, info
-    
     @env_state_reward_wrapper
     def step(self, action_str):
         """
         Take a step in the environment based on the agent's action.
         
         Args:
-            action_str (str): Raw string from LLM containing actions or tool calls
+            action_str (str): Raw string from LLM containing actions
         
         Returns:
             Tuple[Dict, float, bool, Dict]:
@@ -158,11 +103,6 @@ class PrimitiveSkillEnv(BaseEnv):
                 - done: Boolean indicating if episode is complete
                 - info: Dictionary containing metrics and parsed action data
         """
-        # Check if this is a tool call or robot action
-        if self._is_tool_call(action_str):
-            return self._handle_tool_call(action_str)
-        
-        # Original robot action handling
         reward = 0
         rst = self.parse_func(response=action_str,
             special_token_list=self.config.special_token_list,
@@ -183,6 +123,7 @@ class PrimitiveSkillEnv(BaseEnv):
         
         info = self.last_info
         terminated, truncated = False, False
+        
         
         # Execute each action in the list
         for action in rst['actions']:
@@ -214,7 +155,6 @@ class PrimitiveSkillEnv(BaseEnv):
         
         obs = self._render(init_obs=False, valid_actions=valid_actions)
         output_info["metrics"] = metrics
-        output_info["is_tool_step"] = False
         
         self.total_reward += reward
         if isinstance(done, np.ndarray):
@@ -234,18 +174,10 @@ class PrimitiveSkillEnv(BaseEnv):
             max_actions_per_step=self.config.max_actions_per_step,
             action_sep=self.config.action_sep,
             state_keys=self.state_keys,
-            add_example=True,  # Always true for system prompt
-            is_tool_turn=True  # System prompt should show tool examples
+            add_example=True  # Always true for system prompt
         )
         
-        # Import and use the new system_prompt function
-        from .prompt import system_prompt
-        base_prompt = system_prompt()
-        
-        # Use appropriate tools description based on configuration
-        tools_description = self.tools_description
-        
-        return base_prompt + '\n\n' + tools_description + '\n\n' + format_prompt_text
+        return system_prompt() + '\n' + format_prompt_text
     
     def close(self):
         """
@@ -287,7 +219,8 @@ class PrimitiveSkillEnv(BaseEnv):
         """
         return self._compute_reward() - self.initial_reward - self.steps * 0.1
 
-    def _render(self, init_obs=True, valid_actions=None, seed=42):
+    
+    def _render(self, init_obs=True, valid_actions=None,seed=42):
         """
         Render the environment as an observation.
         
@@ -299,8 +232,12 @@ class PrimitiveSkillEnv(BaseEnv):
             Dict: Observation dictionary containing observation string and optional image data
         """
         info = self.last_info.copy()
-        new_info = handle_info(info, state_keys=self.state_keys, mask_success=self.config.mask_success, env=self.env)
-        
+        new_info = handle_info(info, state_keys=self.state_keys,mask_success=self.config.mask_success, env=self.env)
+        positions_list = list(new_info['obj_positions'].values())
+
+        object_positions = str(positions_list)
+        # object_names=str([key.removesuffix("_position") for key in new_info['obj_positions'].keys()])
+        other_information = str(new_info['other_info'])
         instruction = self.env.instruction()
         img_placeholder = self.config.image_placeholder
         x_workspace, y_workspace, z_workspace = get_workspace_limits(self.env)
@@ -310,36 +247,34 @@ class PrimitiveSkillEnv(BaseEnv):
             max_actions_per_step=self.config.max_actions_per_step,
             action_sep=self.config.action_sep,
             state_keys=self.state_keys,
-            add_example=False,  # No examples for action and init obs
-            is_tool_turn=init_obs  # True for first turn, False for subsequent turns
+            add_example=False  # No examples for action and init obs
         )
         
         if init_obs:
-            # Use the init_observation_template from prompt.py
-            from .prompt import init_observation_template
+            # Initial observation
             obs_str = init_observation_template(
                 observation=img_placeholder,
                 instruction=instruction,
                 x_workspace=x_workspace,
                 y_workspace=y_workspace,
                 z_workspace=z_workspace,
-                other_information="No other information needed"
-            )
-            obs_str += "\n" + format_prompt_text
+                object_positions=object_positions,
+                other_information=other_information,
+                #object_names=object_names
+            ) + "\n" + format_prompt_text
         else:
-            # Use the action_template from prompt.py
-            from .prompt import action_template
+            # Subsequent observations include action results
             obs_str = action_template(
+                valid_actions=valid_actions,
                 observation=img_placeholder,
                 instruction=instruction,
                 x_workspace=x_workspace,
                 y_workspace=y_workspace,
                 z_workspace=z_workspace,
-                valid_actions=valid_actions,
-                other_information="No other information needed",
-                tool_results=""  # No tool results in regular step
-            )
-            obs_str += "\n" + format_prompt_text
+                object_positions=object_positions,
+                other_information=other_information,
+                #object_names=object_names
+            ) + "\n" + format_prompt_text
         
         multi_modal_data = None
         if self.config.render_mode == "vision":
@@ -358,62 +293,7 @@ class PrimitiveSkillEnv(BaseEnv):
             return {
                 "obs_str": obs_str,
             }
-
-    def _render_with_tools(self, tool_calls: str, tool_results: str):
-        """
-        Render observation after tool calls
-        
-        Args:
-            tool_calls: Original tool call string
-            tool_results: Formatted tool results
-            
-        Returns:
-            Observation dictionary
-        """
-        info = self.last_info.copy()
-        new_info = handle_info(info, state_keys=self.state_keys, mask_success=self.config.mask_success, env=self.env)
-        
-        instruction = self.env.instruction()
-        img_placeholder = self.config.image_placeholder
-        x_workspace, y_workspace, z_workspace = get_workspace_limits(self.env)
-        
-        # Use the tool_response_template from prompt.py
-        from .prompt import tool_response_template
-        obs_str = tool_response_template(
-            instruction=instruction,
-            x_workspace=x_workspace,
-            y_workspace=y_workspace,
-            z_workspace=z_workspace,
-            tool_results=tool_results,
-            other_information="No other information needed"
-        )
-        
-        # Add format prompt for actions (not tool turn)
-        format_prompt_text = self.format_prompt_func(
-            max_actions_per_step=self.config.max_actions_per_step,
-            action_sep=self.config.action_sep,
-            state_keys=self.state_keys,
-            add_example=False,
-            is_tool_turn=False  # This is for robot actions
-        )
-        obs_str += "\n" + format_prompt_text
-        
-        multi_modal_data = None
-        if self.config.render_mode == "vision":
-            img = self.env.render()
-            multi_modal_data = {
-                img_placeholder: [convert_numpy_to_PIL(img)]
-            }
-        
-        if multi_modal_data is not None:
-            return {
-                "obs_str": obs_str,
-                "multi_modal_data": multi_modal_data,
-            }
-        else:
-            return {
-                "obs_str": obs_str,
-            }
+    
     
     def get_env_state(self):
         """
@@ -422,8 +302,9 @@ class PrimitiveSkillEnv(BaseEnv):
         Returns:
             dict: Dictionary representation of the environment state
         """
-        rst = handle_info(self.last_info, state_keys=self.state_keys, mask_success=self.config.mask_success, env=self.env)
+        rst=handle_info(self.last_info, state_keys=self.state_keys,mask_success=self.config.mask_success, env=self.env)
         return rst["obj_positions"]
+    
     
     def _parse_action(self, action_str):
         """
@@ -491,314 +372,267 @@ class PrimitiveSkillEnv(BaseEnv):
         except (IndexError, ValueError):
             # If any parsing error occurs, return None
             return None
+        
+    def get_raw_observation(self):
+        """
+        Get raw observation data from the underlying ManiSkill environment
+        This includes sensor_data with segmentation information
+        
+        Returns:
+            dict: Raw observation from ManiSkill environment
+        """
+        try:
+            print("Attempting to get raw observation...")
+            
+            # Method 1: Try self.env.get_obs()
+            if hasattr(self.env, 'get_obs'):
+                raw_obs = self.env.get_obs()
+                print(f"Method 1 - self.env.get_obs(): type={type(raw_obs)}")
+                if isinstance(raw_obs, dict):
+                    print(f"Method 1 keys: {list(raw_obs.keys())}")
+                    return raw_obs
+            
+            # Method 2: Try accessing the actual ManiSkill environment
+            # Your env might be a wrapper, let's find the underlying ManiSkill env
+            current_env = self.env
+            print(f"Environment chain:")
+            depth = 0
+            while hasattr(current_env, 'env') and depth < 5:
+                print(f"  Level {depth}: {type(current_env)}")
+                current_env = current_env.env
+                depth += 1
+                
+                # Try to get obs from this level
+                if hasattr(current_env, 'get_obs'):
+                    try:
+                        obs = current_env.get_obs()
+                        print(f"  Level {depth} get_obs(): type={type(obs)}")
+                        if isinstance(obs, dict) and 'sensor_data' in obs:
+                            print(f"  Found sensor_data at level {depth}")
+                            return obs
+                    except Exception as e:
+                        print(f"  Level {depth} get_obs() failed: {e}")
+            
+            # Method 3: Try to trigger a fresh observation
+            print("Method 3: Triggering fresh observation...")
+            
+            # Check what observation mode we're in
+            print(f"Environment obs_mode: {getattr(self.env, 'obs_mode', 'unknown')}")
+            
+            # Check if we need to set obs_mode
+            if hasattr(self.env, 'obs_mode'):
+                current_obs_mode = self.env.obs_mode
+                print(f"Current obs_mode: {current_obs_mode}")
+                
+                # If not in a segmentation mode, we might need to change it
+                if 'segmentation' not in str(current_obs_mode).lower():
+                    print("Current obs_mode doesn't include segmentation")
+                    # Try to find a segmentation-enabled mode
+                    segmentation_modes = ['rgb+depth+segmentation', 'rgbd+segmentation', 'sensor_data']
+                    
+                    for mode in segmentation_modes:
+                        try:
+                            print(f"Trying to set obs_mode to: {mode}")
+                            if hasattr(self.env, 'set_obs_mode'):
+                                self.env.set_obs_mode(mode)
+                            elif hasattr(self.env, 'obs_mode'):
+                                self.env.obs_mode = mode
+                            
+                            # Try to get obs again
+                            obs = self.env.get_obs()
+                            print(f"After setting mode {mode}: type={type(obs)}")
+                            if isinstance(obs, dict):
+                                return obs
+                        except Exception as e:
+                            print(f"Failed to set obs_mode {mode}: {e}")
+            
+            print("❌ Could not get raw observation with sensor_data")
+            return None
+            
+        except Exception as e:
+            print(f"Error getting raw observation: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
+    def get_segmentation_data(self):
+        """
+        Extract segmentation data from the current environment state
+        
+        Returns:
+            tuple: (segmentation_array, segmentation_id_map, object_positions)
+        """
+        try:
+            # Get raw observation
+            raw_obs = self.get_raw_observation()
+            
+            if raw_obs is None:
+                print("Raw observation is None")
+                return None, None, None
+            
+            # Debug: check the type and structure of raw_obs
+            print(f"Raw obs type: {type(raw_obs)}")
+            print(f"Raw obs shape (if tensor): {getattr(raw_obs, 'shape', 'no shape')}")
+            
+            # Handle different types of observations
+            if isinstance(raw_obs, torch.Tensor):
+                print("Raw observation is a tensor - this might be wrong observation type")
+                return None, None, None
+            
+            if not isinstance(raw_obs, dict):
+                print(f"Raw observation is not a dict: {type(raw_obs)}")
+                return None, None, None
+            
+            print(f"Raw obs keys: {list(raw_obs.keys())}")
+            
+            # Extract segmentation data
+            segmentation = None
+            if 'sensor_data' in raw_obs:
+                sensor_data = raw_obs['sensor_data']
+                print(f"Sensor data type: {type(sensor_data)}")
+                
+                if isinstance(sensor_data, dict):
+                    print(f"Sensor data keys: {list(sensor_data.keys())}")
+                    
+                    # Try different camera names
+                    camera_names = ['base_camera', 'camera', 'main_camera']
+                    for camera_name in camera_names:
+                        if camera_name in sensor_data:
+                            camera_data = sensor_data[camera_name]
+                            print(f"Camera {camera_name} data type: {type(camera_data)}")
+                            
+                            if isinstance(camera_data, dict):
+                                print(f"Camera {camera_name} keys: {list(camera_data.keys())}")
+                                
+                                if 'segmentation' in camera_data:
+                                    seg_data = camera_data['segmentation']
+                                    print(f"Found segmentation data: type={type(seg_data)}, shape={getattr(seg_data, 'shape', 'no shape')}")
+                                    
+                                    # Convert torch tensor to numpy if needed
+                                    if hasattr(seg_data, 'cpu'):
+                                        seg_data = seg_data.cpu().numpy()
+                                    
+                                    # Handle batch and channel dimensions
+                                    if len(seg_data.shape) == 4:  # [batch, H, W, channels]
+                                        seg_data = seg_data[0]  # Take first batch
+                                    if len(seg_data.shape) == 3 and seg_data.shape[-1] == 1:
+                                        seg_data = seg_data.squeeze(-1)  # Remove channel dim
+                                    
+                                    segmentation = seg_data.astype(np.int16)
+                                    print(f"Processed segmentation: shape={segmentation.shape}, dtype={segmentation.dtype}")
+                                    break
+            else:
+                print("No 'sensor_data' key found in raw observation")
+            
+            # Get segmentation ID mapping
+            segmentation_id_map = {}
+            if hasattr(self.env, 'unwrapped') and hasattr(self.env.unwrapped, 'segmentation_id_map'):
+                segmentation_id_map = self.env.unwrapped.segmentation_id_map
+                print(f"Found segmentation_id_map via unwrapped: {len(segmentation_id_map)} entries")
+            elif hasattr(self.env, 'segmentation_id_map'):
+                segmentation_id_map = self.env.segmentation_id_map
+                print(f"Found segmentation_id_map directly: {len(segmentation_id_map)} entries")
+            else:
+                print("No segmentation_id_map found")
+            
+            # Get object positions (already available through your existing method)
+            object_positions = self.get_env_state()
+            print(f"Found object positions: {len(object_positions)} entries")
+            
+            return segmentation, segmentation_id_map, object_positions
+            
+        except Exception as e:
+            print(f"Error extracting segmentation data: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None, None
+
+    def get_current_image(self):
+        """
+        Get the current rendered image as numpy array
+        
+        Returns:
+            np.ndarray: RGB image array (H, W, 3) or None if not available
+        """
+        try:
+            if self.config.render_mode == "vision":
+                img = self.env.render()
+                return img
+            else:
+                print("Environment not in vision mode - cannot get image")
+                return None
+        except Exception as e:
+            print(f"Error getting current image: {e}")
+            return None
+
+    def enable_segmentation_access(self):
+        """
+        Ensure the environment is configured to provide segmentation data
+        This should be called during initialization if segmentation is needed
+        """
+        # Make sure we're in a mode that provides visual data
+        if self.config.render_mode != "vision":
+            print("Warning: render_mode is not 'vision' - segmentation may not be available")
+        
+        # Check if segmentation data is accessible
+        segmentation, seg_id_map, positions = self.get_segmentation_data()
+        
+        if segmentation is not None:
+            print(f"✅ Segmentation access enabled: {segmentation.shape}")
+            print(f"✅ Found {len(seg_id_map)} segmentation IDs")
+            print(f"✅ Found {len(positions)} object positions")
+            return True
+        else:
+            print("❌ Segmentation access failed")
+            return False
+        
 if __name__ == "__main__":
     """
-    Interactive test for enhanced PrimitiveSkillEnv with YOLO support
-    """
-    import argparse
-    import os
+    Example usage of the manipulation environment.
     
-    parser = argparse.ArgumentParser(description="Test PrimitiveSkill Environment with Enhanced Tools")
+    This code demonstrates how to create an instance of the environment,
+    reset it, and interact with it using manual input actions.
+    """
+    # AlignTwoCube,PlaceTwoCube,PutAppleInDrawer,StackThreeCube
+    
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Test Navigation Environment")
     parser.add_argument(
         "--env_id",
         type=str,
-        default="PlaceTwoCube",
-        choices=["AlignTwoCube", "PlaceTwoCube", "PutAppleInDrawer", "StackThreeCube"],
-        help="Environment to test"
+        default="AlignTwoCube",
     )
-    parser.add_argument(
-        "--save_images",
-        action="store_true", 
-        help="Save images during interaction"
-    )
-    parser.add_argument(
-        "--enable_yolo",
-        action="store_true",
-        default=True,
-        help="Enable YOLO enhanced tools (default: True)"
-    )
-    parser.add_argument(
-        "--yolo_model",
-        type=str,
-        default="yolov8n.pt",
-        choices=["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"],
-        help="YOLO model to use"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        choices=["cpu", "cuda"],
-        help="Device for YOLO inference"
-    )
-    
     args = parser.parse_args()
     
-    # Create environment config with enhanced tools
-    config = PrimitiveSkillEnvConfig(
-        env_id=args.env_id,
-        render_mode="vision",
-        record_video=False,
-        mask_success=True,
-        enable_enhanced_tools=args.enable_yolo,
-        toolbase_config={
-            'enable_yolo': args.enable_yolo,
-            'yolo': {
-                'model_path': args.yolo_model,
-                'device': args.device,
-                'confidence_threshold': 0.5
-            }
-        }
-    )
-    
-    # Initialize environment
-    print(f"🔧 Initializing {args.env_id} environment...")
-    if args.enable_yolo:
-        print(f"🤖 Enhanced tools enabled with YOLO {args.yolo_model} on {args.device}")
-    else:
-        print(f"🛠️ Basic tools only (YOLO disabled)")
-    
+    config = PrimitiveSkillEnvConfig(record_video=True, video_record_dir="./test_manipulation_video",env_id=args.env_id, render_mode="vision")
     env = PrimitiveSkillEnv(config)
     
-    # Save directory for images
-    if args.save_images:
-        save_dir = f"./test_images_{args.env_id}_{'yolo' if args.enable_yolo else 'basic'}"
-        os.makedirs(save_dir, exist_ok=True)
-        print(f"📁 Images will be saved to: {save_dir}")
+    print(env.system_prompt())
+    obs, info = env.reset()
+    print(obs["obs_str"])
     
-    print("✓ Environment initialized!")
+    i = 0
+    import os
+    if config.render_mode == 'vision':
+        os.makedirs("./test_manipulation", exist_ok=True)
+        img = obs["multi_modal_data"][config.image_placeholder][0]
+        img.save(f"./test_manipulation/manipulation_{i}.png")
     
-    def save_image(obs, step, suffix=""):
-        """Save current image"""
-        if args.save_images and 'multi_modal_data' in obs:
-            img = obs['multi_modal_data'][config.image_placeholder][0]
-            filename = f"step_{step:02d}{suffix}.png"
-            filepath = os.path.join(save_dir, filename)
-            img.save(filepath)
-            print(f"📷 Saved: {filename}")
-    
-    def print_system_prompt():
-        """Print the system prompt"""
-        print("\n" + "="*80)
-        print("📋 SYSTEM PROMPT:")
-        print("="*80)
-        print(env.system_prompt())
-        print("="*80)
-    
-    def print_available_tools():
-        """Print available tools based on configuration"""
-        print("\n💡 Available Commands:")
-        print("  Basic Tools:")
-        print("    get_objects() - List all visible objects")
-        print("    get_pos(color) - Get position by color (e.g., get_pos(red))")
-        print("    get_targets() - Get all target positions")
-        print("    get_workspace() - Get workspace boundaries")
-        
-        if args.enable_yolo:
-            print("  Enhanced YOLO Tools:")
-            print("    detect_scene() - YOLO detection of all objects")
-            print("    find_object(description) - Find by description (e.g., find_object(\"red cube\"))")
-            print("    get_spatial_relations() - Analyze spatial relationships")
-        
-        print("  Robot Actions:")
-        print("    pick(x,y,z) - Grasp object at position")
-        print("    place(x,y,z) - Place object at position")
-        print("    push(x1,y1,z1,x2,y2,z2) - Push object")
-        
-        print("  Control Commands:")
-        print("    reset - Reset environment")
-        print("    prompt - Show system prompt")
-        print("    tools - Show this tool list")
-        print("    save - Save current image")
-        print("    quit/q/exit - Exit")
-    
-    def test_yolo_tools():
-        """Test YOLO tools functionality"""
-        if not args.enable_yolo:
-            print("⚠️ YOLO tools not enabled")
-            return
-            
-        print("\n🧪 Testing YOLO tools...")
-        try:
-            # Test detect_scene
-            print("Testing detect_scene()...")
-            result = env.tools.detect_scene_objects()
-            if result.success:
-                print(f"✓ detect_scene: {result.message}")
-                print(f"  Detected {len(result.data.get('enhanced_detections', []))} objects")
-            else:
-                print(f"❌ detect_scene failed: {result.message}")
-            
-            # Test find_object if objects detected
-            if result.success and result.data.get('enhanced_detections'):
-                detected_classes = [item['yolo_detection']['class_name'] 
-                                  for item in result.data['enhanced_detections']]
-                if detected_classes:
-                    test_class = detected_classes[0]
-                    print(f"Testing find_object(\"{test_class}\")...")
-                    find_result = env.tools.find_object_by_description(test_class)
-                    if find_result.success:
-                        print(f"✓ find_object: Found {test_class}")
-                    else:
-                        print(f"❌ find_object failed: {find_result.message}")
-            
-            # Test spatial relations
-            print("Testing get_spatial_relations()...")
-            spatial_result = env.tools.get_spatial_relationships()
-            if spatial_result.success:
-                relations = spatial_result.data.get('relationships', [])
-                print(f"✓ get_spatial_relations: Found {len(relations)} relationships")
-                for relation in relations[:3]:  # Show first 3
-                    print(f"  - {relation}")
-            else:
-                print(f"❌ get_spatial_relations failed: {spatial_result.message}")
-                
-        except Exception as e:
-            print(f"❌ YOLO test failed: {e}")
-    
-    try:
-        print("\n🎮 Starting Interactive Session")
-        print(f"🎯 Task: {args.env_id}")
-        
-        # Show system prompt
-        print_system_prompt()
-        
-        # Reset environment
-        print("\n🔄 Resetting environment...")
-        obs, info = env.reset()
-        step = 0
-        
-        # Save initial image
-        save_image(obs, step, "_initial")
-        
-        # Show initial observation
-        print("\n📖 INITIAL OBSERVATION:")
-        print("-" * 60)
+    while True:
+        i += 1
+        action = input("Enter action:")
+        #action = f"<think>Let me try this direction.</think><answer>{action}</answer>"
+        obs, reward, done, info = env.step(action)
         print(obs["obs_str"])
-        print("-" * 60)
         
-        # Show available tools
-        print_available_tools()
+        if config.render_mode == 'vision':
+            img = obs["multi_modal_data"][config.image_placeholder][0]
+            img.save(f"./test_manipulation/manipulation_{i}.png")
         
-        # Test YOLO tools if enabled
-        if args.enable_yolo:
-            test_yolo_tools()
-        
-        # Interactive loop
-        while True:
-            try:
-                user_input = input(f"\n[Step {step}]> ").strip()
-                
-                if not user_input:
-                    continue
-                
-                if user_input.lower() in ['quit', 'q', 'exit']:
-                    print("👋 Goodbye!")
-                    break
-                    
-                elif user_input.lower() == 'reset':
-                    print("🔄 Resetting environment...")
-                    obs, info = env.reset()
-                    step = 0
-                    save_image(obs, step, "_reset")
-                    print("✓ Environment reset!")
-                    continue
-                    
-                elif user_input.lower() == 'prompt':
-                    print_system_prompt()
-                    continue
-                    
-                elif user_input.lower() == 'tools':
-                    print_available_tools()
-                    continue
-                    
-                elif user_input.lower() == 'test' and args.enable_yolo:
-                    test_yolo_tools()
-                    continue
-                    
-                elif user_input.lower() == 'save':
-                    save_image(obs, step, "_manual")
-                    continue
-                
-                # Execute user input as action/tool call
-                print(f"🤖 Executing: {user_input}")
-                
-                try:
-                    obs, reward, done, info = env.step(user_input)
-                    step += 1
-                    
-                    # Save image after action
-                    if info.get('is_tool_step', False):
-                        save_image(obs, step, "_tool")
-                    else:
-                        save_image(obs, step, "_action")
-                    
-                    # Show results
-                    print(f"✓ Executed successfully!")
-                    print(f"📊 Reward: {reward:.2f}")
-                    print(f"🏁 Done: {done}")
-                    
-                    if info.get('is_tool_step', False):
-                        print(f"🛠️ Tool calls executed: {info.get('tool_calls_executed', 0)}")
-                        if 'tool_response' in info:
-                            print(f"🔧 Tool results:")
-                            print(info['tool_response'])
-                    else:
-                        valid_actions = info.get('metrics', {}).get('turn_metrics', {}).get('action_is_valid', False)
-                        print(f"🎯 Action valid: {valid_actions}")
-                    
-                    # Show new observation
-                    print("\n📖 NEW OBSERVATION:")
-                    print("-" * 60)
-                    print(obs["obs_str"])
-                    print("-" * 60)
-                    
-                    if done:
-                        success = info.get('metrics', {}).get('traj_metrics', {}).get('success', False)
-                        if success:
-                            print("🎉 Task completed successfully!")
-                        else:
-                            print("❌ Episode ended (failed or timeout)")
-                        
-                        choice = input("\nReset for another attempt? (y/n): ").strip().lower()
-                        if choice == 'y':
-                            obs, info = env.reset()
-                            step = 0
-                            save_image(obs, step, "_new_episode")
-                            print("✓ Environment reset for new episode!")
-                        else:
-                            break
-                
-                except Exception as e:
-                    print(f"❌ Error executing action: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    
-            except KeyboardInterrupt:
-                print("\n👋 Interrupted by user")
-                break
-            except Exception as e:
-                print(f"❌ Unexpected error: {str(e)}")
+        if done:
+            break
     
-    finally:
-        # Cleanup
-        env.close()
-        print("🔧 Environment closed")
-        if args.save_images:
-            print(f"📁 Images saved in: {save_dir}")
-        
-        # Show final statistics
-        total_reward = env.compute_reward()
-        print(f"📊 Final total reward: {total_reward:.2f}")
-        
-        # Show tool usage summary
-        if args.enable_yolo:
-            yolo_status = "✓ Available" if hasattr(env.tools, 'yolo_detector') and env.tools.yolo_detector else "❌ Failed"
-            print(f"🤖 YOLO Status: {yolo_status}")
-        
-        print("\n🎯 Usage Examples:")
-        print("  Basic: python env.py --env_id PlaceTwoCube")
-        print("  With YOLO: python env.py --env_id PlaceTwoCube --enable_yolo --yolo_model yolov8s.pt")
-        print("  GPU: python env.py --enable_yolo --device cuda")
-        print("  Save images: python env.py --save_images")
+    print(f"Total reward: {env.compute_reward()}")
+    print(info)
+    env.close()
