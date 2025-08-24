@@ -213,7 +213,7 @@ class PlaceTwoCubeEnv(BaseEnv):
     
     def get_segmentation_data(self):
         """
-        Get filtered segmentation data for PlaceTwoCube task
+        Get filtered segmentation data for PlaceTwoCube task with consistent name mapping
         
         Returns:
             tuple: (segmentation_array, segmentation_id_map, object_positions)
@@ -252,9 +252,17 @@ class PlaceTwoCubeEnv(BaseEnv):
         elif hasattr(self, 'unwrapped') and hasattr(self.unwrapped, 'segmentation_id_map'):
             full_seg_map = self.unwrapped.segmentation_id_map
         
-        # Filter for PlaceTwoCube task - only keep cubes and goal regions
+        # Define name mapping for SAM understanding
+        name_mapping = {
+            'goal_region_A': 'left_target',
+            'goal_region_B': 'right_target'
+            # Add more mappings as needed for other objects
+        }
+        
+        # Task objects we want to keep
         task_objects = ['red_cube', 'green_cube', 'left_target', 'right_target']
         
+        # Filter and remap objects
         filtered_seg_map = {}
         new_id_mapping = {}
         new_id = 1
@@ -263,30 +271,31 @@ class PlaceTwoCubeEnv(BaseEnv):
             if obj_id == 0:
                 continue
             
+            # Extract original object name
             obj_str = str(obj_info)
             if '<' in obj_str and ':' in obj_str:
-                obj_name = obj_str.split('<')[1].split(':')[0].strip()
-                
-                if obj_name == 'goal_region_A':
-                    obj_name = 'left_target'
-                elif obj_name == 'goal_region_B':
-                    obj_name = 'right_target'
-                
-                for target_name in task_objects:
-                    if target_name in obj_name:
-                        filtered_seg_map[new_id] = obj_info   
-                        new_id_mapping[obj_id] = new_id
-                        new_id += 1
-                        break
+                original_name = obj_str.split('<')[1].split(':')[0].strip()
+            else:
+                original_name = f"object_{obj_id}"
+            
+            # Apply name mapping
+            mapped_name = name_mapping.get(original_name, original_name)
+            
+            # Check if this object should be included
+            if mapped_name in task_objects or any(target in mapped_name for target in task_objects):
+                # Create mapped object info
+                mapped_obj_info = self._create_mapped_object_info(mapped_name, obj_info)
+                filtered_seg_map[new_id] = mapped_obj_info
+                new_id_mapping[obj_id] = new_id
+                new_id += 1
         
-        # Create filtered segmentation array - only mark the 4 objects, everything else is 0
+        # Create filtered segmentation array - only mark task objects, everything else is 0
         filtered_segmentation = np.zeros_like(segmentation, dtype=np.int16)
         for old_id, new_id in new_id_mapping.items():
             mask = (segmentation == old_id)
             filtered_segmentation[mask] = new_id
-            
         
-        # Get object positions (in mm for robot actions)
+        # Create consistent object_positions using mapped names + _position suffix
         object_positions = {
             'red_cube_position': (self.red_cube.pose.p.cpu().numpy() * 1000).tolist(),
             'green_cube_position': (self.green_cube.pose.p.cpu().numpy() * 1000).tolist(),
@@ -295,3 +304,25 @@ class PlaceTwoCubeEnv(BaseEnv):
         }
         
         return filtered_segmentation, filtered_seg_map, object_positions
+
+    def _create_mapped_object_info(self, mapped_name, original_obj_info):
+        """
+        Create object info with mapped name for SAM understanding
+        
+        Args:
+            mapped_name: The mapped name (e.g., 'left_target')
+            original_obj_info: Original object info from environment
+        
+        Returns:
+            Object info with mapped name
+        """
+        # Create a simple object info that SAM matcher can understand
+        # The exact format depends on how your SAM matcher extracts names
+        class MappedObjectInfo:
+            def __init__(self, name):
+                self.name = name
+            
+            def __str__(self):
+                return f"<{self.name}: mapped object>"
+        
+        return MappedObjectInfo(mapped_name)

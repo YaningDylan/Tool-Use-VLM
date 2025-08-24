@@ -457,94 +457,15 @@ class PrimitiveSkillEnv(BaseEnv):
 
     def get_segmentation_data(self):
         """
-        Extract segmentation data from the current environment state
+        Get segmentation data from the underlying environment
         
         Returns:
             tuple: (segmentation_array, segmentation_id_map, object_positions)
         """
-        try:
-            # Get raw observation
-            raw_obs = self.get_raw_observation()
-            
-            if raw_obs is None:
-                print("Raw observation is None")
-                return None, None, None
-            
-            # Debug: check the type and structure of raw_obs
-            print(f"Raw obs type: {type(raw_obs)}")
-            print(f"Raw obs shape (if tensor): {getattr(raw_obs, 'shape', 'no shape')}")
-            
-            # Handle different types of observations
-            if isinstance(raw_obs, torch.Tensor):
-                print("Raw observation is a tensor - this might be wrong observation type")
-                return None, None, None
-            
-            if not isinstance(raw_obs, dict):
-                print(f"Raw observation is not a dict: {type(raw_obs)}")
-                return None, None, None
-            
-            print(f"Raw obs keys: {list(raw_obs.keys())}")
-            
-            # Extract segmentation data
-            segmentation = None
-            if 'sensor_data' in raw_obs:
-                sensor_data = raw_obs['sensor_data']
-                print(f"Sensor data type: {type(sensor_data)}")
-                
-                if isinstance(sensor_data, dict):
-                    print(f"Sensor data keys: {list(sensor_data.keys())}")
-                    
-                    # Try different camera names
-                    camera_names = ['base_camera', 'camera', 'main_camera']
-                    for camera_name in camera_names:
-                        if camera_name in sensor_data:
-                            camera_data = sensor_data[camera_name]
-                            print(f"Camera {camera_name} data type: {type(camera_data)}")
-                            
-                            if isinstance(camera_data, dict):
-                                print(f"Camera {camera_name} keys: {list(camera_data.keys())}")
-                                
-                                if 'segmentation' in camera_data:
-                                    seg_data = camera_data['segmentation']
-                                    print(f"Found segmentation data: type={type(seg_data)}, shape={getattr(seg_data, 'shape', 'no shape')}")
-                                    
-                                    # Convert torch tensor to numpy if needed
-                                    if hasattr(seg_data, 'cpu'):
-                                        seg_data = seg_data.cpu().numpy()
-                                    
-                                    # Handle batch and channel dimensions
-                                    if len(seg_data.shape) == 4:  # [batch, H, W, channels]
-                                        seg_data = seg_data[0]  # Take first batch
-                                    if len(seg_data.shape) == 3 and seg_data.shape[-1] == 1:
-                                        seg_data = seg_data.squeeze(-1)  # Remove channel dim
-                                    
-                                    segmentation = seg_data.astype(np.int16)
-                                    print(f"Processed segmentation: shape={segmentation.shape}, dtype={segmentation.dtype}")
-                                    break
-            else:
-                print("No 'sensor_data' key found in raw observation")
-            
-            # Get segmentation ID mapping
-            segmentation_id_map = {}
-            if hasattr(self.env, 'unwrapped') and hasattr(self.env.unwrapped, 'segmentation_id_map'):
-                segmentation_id_map = self.env.unwrapped.segmentation_id_map
-                print(f"Found segmentation_id_map via unwrapped: {len(segmentation_id_map)} entries")
-            elif hasattr(self.env, 'segmentation_id_map'):
-                segmentation_id_map = self.env.segmentation_id_map
-                print(f"Found segmentation_id_map directly: {len(segmentation_id_map)} entries")
-            else:
-                print("No segmentation_id_map found")
-            
-            # Get object positions (already available through your existing method)
-            object_positions = self.get_env_state()
-            print(f"Found object positions: {len(object_positions)} entries")
-            
-            return segmentation, segmentation_id_map, object_positions
-            
-        except Exception as e:
-            print(f"Error extracting segmentation data: {e}")
-            import traceback
-            traceback.print_exc()
+        if hasattr(self.env, 'get_segmentation_data'):
+            return self.env.get_segmentation_data()
+        else:
+            print(f"Warning: Environment {type(self.env)} does not have get_segmentation_data method")
             return None, None, None
 
     def get_current_image(self):
